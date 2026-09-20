@@ -8,7 +8,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 核心思路：搭建一个提供视频直链的 HTTP(S) 服务器，让 VRChat 世界中的视频播放器请求该服务器上的视频，完整记录并分析游戏侧发出的请求（请求头、TLS 握手、Range 行为、重定向跟随等），与浏览器的请求做对比。
 
-**当前状态：`server.py` 已支持 HTTP 直链、HTTPS 直接终止 TLS（记录握手细节）、以及 H265→H264 fallback（token 跳转）。已部署到公网 sakura VPS（HTTP :8080 / HTTPS :8443，域名 g.yxu33.com，用 Caddy 签的 Let's Encrypt 证书）。下一步是真机测试 fallback 的几个未验证行为（播放器是否跟 302、yt-dlp 传原始还是解析后 URL、重试打哪里）。运维/连接细节见记忆库。**
+**当前状态：`server.py` 已支持 HTTP 直链、HTTPS 直接终止 TLS（记录握手细节）、以及 H265→H264 fallback（token 跳转）。已部署到公网 sakura VPS（HTTP :8080 / HTTPS :8443，域名 g.yxu33.com，用 Caddy 签的 Let's Encrypt 证书）。fallback 已于 2026-07 真机验证（播放器跟 302、yt-dlp 交 token URL、重试打原 token）。`cdn-redirect` 分支新增 **CDN 模式**（`--cdn-base`）：本机只做 302，字节由 CDN/对象存储出，尚未真机验证。运维/连接细节见记忆库。**
 
 ## Python 环境
 
@@ -27,6 +27,12 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 & "C:\Users\mbp\.conda\envs\vrc-net\python.exe" server.py --port 8080 `
     --tls-port 8443 --tls-cert cert.pem --tls-key key.pem
 
+# CDN 模式：播放器请求 /t/<token> 时只回 302 到 <cdn-base><file>，本机不发视频字节
+& "C:\Users\mbp\.conda\envs\vrc-net\python.exe" server.py --cdn-base https://cdn.example.com/vrc/
+
+# 跑测试（纯 unittest，无第三方依赖；TLS 组需要 openssl 命令，Git Bash 自带）
+& "C:\Users\mbp\.conda\envs\vrc-net\python.exe" -m unittest discover -s tests -v
+
 # 把视频切成 HLS（m3u8+ts）放进 media\<name>\ ——需要 ffmpeg（本机已通过
 # winget install Gyan.FFmpeg 安装，已在 PATH）
 & "C:\Users\mbp\.conda\envs\vrc-net\python.exe" make_hls.py input.mp4 --name demo
@@ -37,7 +43,9 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 - 变体链写在 `media/fallback.json`，index 0 = 首选（最省流量/最难解码），末尾 = 最兼容兜底。当前 demo：`{"demo": {"variants": ["demo_av1.mp4", "demo_vp9.webm", "demo_h265.mp4", "demo_h264.mp4"]}}`（旧的 `primary`/`fallback` 两档写法仍兼容，会归一化成 variants）。
 - 世界里填 `/fb/<name>`（如 `.../fb/demo`），服务器 302 到 `/t/<token>/<file>`；token 每次唯一，免疫 CGNAT。
 - 降级判据在 `note_attempt_and_decide`：同一 IP 的播放器（NSPlayer/WMFSDK/Unity UA，排除 yt-dlp 探测）"从头再来"且在当前档从没有过一次 >20MB 的传输 → 判为该编码解不了 → 往下退一档，直到能播或到最兼容档。阈值 `SUSTAINED_THRESHOLD` / `RETRY_MIN_GAP` 在文件头部常量区可调。
-- 逻辑改动后的验证方式：起线程内服务器 + http.client 驱动，断言 302 目标与 serve 内容（2026-07 曾以此验证 fallback 链 8 项 + TLS 4 项；当时的测试脚本放在会话 scratchpad 里已丢失，若需重跑请重建到 `tests/` 并入库）。
+- 逻辑改动后跑 `tests/`（`test_fallback.py` 本地模式 11 项 + CDN 模式 9 项，`test_tls.py` 4 项）：线程内起 ProbeHandler + http.client 驱动，通过回拨 `IP_STATE[ip]["last_player_ts"]` 模拟时间间隔，不 sleep。
+- **CDN 模式**（`--cdn-base URL`）：`/fb` 不变；`/t/<token>` 对播放器 UA 一律 302 到 `<URL><file>`（当前档），对非播放器 UA（yt-dlp 探测/浏览器）仍本地 serve 200——这样 yt-dlp 交给播放器的是本机 token 地址，重试才打得回来。**media/ 下仍要有同名文件**（yt-dlp 需要 200 + Content-Length）。本机看不到字节，降级判据改为：`RETRY_MIN_GAP < 间隔 <= RETRY_MAX_GAP`(60s) 且无进度证据；进度证据 = 播放器把片中 Range（起始 ≥ `SUSTAINED_THRESHOLD` 且不在末尾 `PROGRESS_TAIL_IGNORE` 索引区）打回 token 地址（`note_progress`）。代价：失败后隔 >60s 手动重播要多失败一轮才退档。
+- CDN 模式待真机验证：①跳转目标换成另一个主机（且 http→https）后 WMF 是否仍跟 302、重试是否仍打本机 token 地址（7 月只验证过同主机）；②WMF 片中 Range 是打 token 地址还是 CDN 地址（决定 `progress_offset` 信号是否存在，看日志 `fallback.progress_offset`）；③建议本机入口用 :8443 HTTPS，避免 http→https 跨协议跳转。
 - 生成多编码测试片：服务器上已装 ffmpeg，`deploy/gen_testclips.sh` 用 testsrc 图案生成 av1/vp9/h265/h264 四档短片到 `media/`（解码能力测试只看编码、不看内容）。
 
 - 服务器零第三方依赖（纯标准库），跨平台，**要求 Python ≥ 3.9**（用了 `Path.is_relative_to`）。浏览器打开 `http://<IP>:8080/` 有文件索引页。
@@ -59,7 +67,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
   - `query`：URL 查询串（不参与文件定位）。多人测试时给每人发 `?tag=名字` 的 URL，按此字段区分测试者（比按 IP 可靠，IP 有 CGNAT 合并问题）
 - `protocol_error`：畸形请求行等解析失败，同样有分析价值。
 - `connection_open.tls`：HTTPS 连接的握手协商结果 `{version, cipher, alpn, sni}`（非 TLS 连接无此字段）。
-- `request.fallback`：走 `/fb` 或 `/t` 的请求带此对象，含 `via`(base/token)、`variant`/`decided_variant`、`token`、`is_player`、`downgraded_now`、以及 token 端二次跳时的 `redirect_to`——分析 fallback 是否按预期触发的核心字段。
+- `request.fallback`：走 `/fb` 或 `/t` 的请求带此对象，含 `via`(base/token)、`file`、`token_level`/`decided_level`、`token`、`is_player`、`stepped_down`、以及二次跳时的 `redirect_to`——分析 fallback 是否按预期触发的核心字段。CDN 模式下多 `cdn: true`（`redirect_to` 为 CDN 地址）和 `progress_offset`（片中 Range 被计为进度证据时）。
 
 分析流程：同一 URL 分别用 Unity 播放器、AVPro 播放器、浏览器请求后，把对应 jsonl 交给 Codex 对比（按 `client_ip` + User-Agent 区分来源；注意 VRChat 对非直链 URL 会先出现 yt-dlp 的请求，UA 不同于播放器本体）。
 

@@ -8,10 +8,13 @@
 2. TLS：--tls-port 直接终止 TLS（读 Caddy 签好的证书），记录握手细节。
 3. Fallback：/fb/<name> 302 到带 token 的 /t/<token>/<file>，对无法解码 H265
    的客户端自动降级到 H264（详见 media/fallback.json 与下方 note_attempt_and_decide）。
+4. CDN 模式：--cdn-base 设定后本机只做跳转控制（几百字节的 302），视频字节由 CDN /
+   对象存储发出；降级判据改用重试时间窗（见 RETRY_MAX_GAP）。
 
 用法:
     python server.py [--port 8080] [--host 0.0.0.0] [--media-dir media]
     python server.py --tls-port 8443 --tls-cert cert.pem --tls-key key.pem
+    python server.py --cdn-base https://cdn.example.com/vrc/
 """
 
 import argparse
@@ -70,6 +73,16 @@ SUSTAINED_THRESHOLD = 20 * 1024 * 1024
 # 距上次播放器尝试超过这个间隔、又从头(bytes=0-)开始的请求，判定为"重试"。
 # VRChat 视频加载失败后有约 5s 冷却再重试；成功播放不会从头重来。
 RETRY_MIN_GAP = 3.0
+# --cdn-base 模式下字节由 CDN 发，本机看不到传输量，无法用 SUSTAINED_THRESHOLD 排除
+# "正常播完又从头重播"；改用时间窗：解码失败的自动重试间隔在十几秒内，超过这个
+# 间隔才从头来的当作新一次播放，不退档。（代价：失败后隔很久手动重播要多失败一轮。）
+RETRY_MAX_GAP = 60.0
+# CDN 模式下播放器若把片中的 Range 请求也打回 token 地址，其起始偏移就是播放进度
+# 证据（解不了码的播放器不会读到片中）；但文件尾部这段是索引(moov/Cues)读取，不算。
+PROGRESS_TAIL_IGNORE = 32 * 1024 * 1024
+# 设置后 /t/<token>/<file> 对播放器 UA 只回 302 到 <cdn-base><file>，字节由 CDN 出；
+# None = 本地 serve（探针模式）。由 --cdn-base 设置，保证以 "/" 结尾。
+CDN_BASE = None
 
 # TLS 连接的 SNI 无法从 SSLSocket 直接读，用 SNI 回调按 id(sock) 暂存
 SNI_BY_CONN = {}
@@ -135,6 +148,9 @@ def note_attempt_and_decide(ip, name, is_player, is_new_attempt, now):
     满足则往下退一档（换更兼容的编码），直到最后一档兜底。
     这样能把「解码失败后的重试」与「成功播放前正常的启动期爬行重连」区分开。
 
+    CDN 模式(CDN_BASE 已设)下本机不发字节，best_bytes 只能靠 note_progress 的 Range
+    偏移间接填充；为防"正常播完后重播"被误判，额外要求间隔不超过 RETRY_MAX_GAP。
+
     返回 (level, filename, stepped_down)。
     """
     with FALLBACK_LOCK:
@@ -144,8 +160,10 @@ def note_attempt_and_decide(ip, name, is_player, is_new_attempt, now):
         st = IP_STATE.setdefault(ip, _new_ip_state())
         stepped = False
         if is_player and is_new_attempt:
-            if (st["last_player_ts"] is not None
-                    and now - st["last_player_ts"] > RETRY_MIN_GAP
+            gap = None if st["last_player_ts"] is None else now - st["last_player_ts"]
+            looks_like_retry = (gap is not None and gap > RETRY_MIN_GAP
+                                and (CDN_BASE is None or gap <= RETRY_MAX_GAP))
+            if (looks_like_retry
                     and st["best_bytes"] < SUSTAINED_THRESHOLD
                     and st["level"] < last_index):
                 st["level"] += 1
@@ -163,6 +181,15 @@ def note_bytes(ip, bytes_sent):
         st = IP_STATE.setdefault(ip, _new_ip_state())
         if bytes_sent > st["best_bytes"]:
             st["best_bytes"] = bytes_sent
+
+
+def note_progress(ip, token_level, offset):
+    """CDN 模式：播放器对 token 地址发来片中 Range，把起始偏移当作该档的传输量证据。
+    只在 token 的档位就是该 IP 当前档时计入，免得旧档 token 的读取给新档"背书"。"""
+    with FALLBACK_LOCK:
+        st = IP_STATE.setdefault(ip, _new_ip_state())
+        if st["level"] == token_level and offset > st["best_bytes"]:
+            st["best_bytes"] = offset
 
 
 def log_event(record: dict) -> None:
@@ -398,22 +425,67 @@ class ProbeHandler(BaseHTTPRequestHandler):
                               "is_player": is_player, "stepped_down": stepped}
         self._send_redirect(location, resp, {"level": level})
 
+    def _cdn_progress_offset(self, info):
+        """CDN 模式：播放器打回 token 地址的非开头 Range，若起始偏移落在
+        [SUSTAINED_THRESHOLD, 文件尾索引区) 之间，返回该偏移作为播放进度证据，否则 None。
+        需要本地有同名文件才能知道尾部在哪；没有就不产生该信号（只剩时间窗判定）。"""
+        rng = self.headers.get("Range", "")
+        if not rng.startswith("bytes="):
+            return None
+        first = rng[len("bytes="):].split(",", 1)[0].split("-", 1)[0].strip()
+        if not first.isdigit():
+            return None
+        start = int(first)
+        local = MEDIA_ROOT / info["file"]
+        try:
+            size = local.stat().st_size
+        except OSError:
+            return None
+        if SUSTAINED_THRESHOLD <= start < size - PROGRESS_TAIL_IGNORE:
+            return start
+        return None
+
     def _handle_token(self, token, include_body, record, resp):
-        """token 化的实际取片地址；若该 IP 已退到更兼容的档，而 token 仍指旧档，再跳一次。"""
+        """token 化的实际取片地址；若该 IP 已退到更兼容的档，而 token 仍指旧档，再跳一次。
+
+        CDN 模式(CDN_BASE 已设)：播放器 UA 一律 302 到 CDN 上当前档的文件，本机不发字节；
+        非播放器（yt-dlp 探测、浏览器）仍本地 serve——yt-dlp 必须在这里拿到 200，
+        它才会把这个 token 地址（而非 CDN 地址）交给播放器，之后播放器的重试才打得回本机。
+        """
         info = TOKENS.get(token)
         if not info:
             record["file"] = None
             self._send_simple(404, b"unknown or expired token\n", resp)
             return
         name = info["name"]
+        ip = self.client_address[0]
         ua = self.headers.get("User-Agent", "")
         is_player = is_player_ua(ua)
+        new_attempt = self._new_attempt()
+        progress = None
+        if CDN_BASE and is_player and not new_attempt:
+            progress = self._cdn_progress_offset(info)
+            if progress is not None:
+                note_progress(ip, info["level"], progress)
         level, filename, stepped = note_attempt_and_decide(
-            self.client_address[0], name, is_player, self._new_attempt(), time.time())
+            ip, name, is_player, new_attempt, time.time())
         record["fallback"] = {"via": "token", "name": name, "token": token,
                               "token_level": info["level"], "decided_level": level,
                               "file": filename, "is_player": is_player,
                               "stepped_down": stepped}
+        if progress is not None:
+            record["fallback"]["progress_offset"] = progress
+        if CDN_BASE and is_player:
+            if not filename:
+                record["file"] = None
+                self._send_simple(404, b"variant file missing\n", resp)
+                return
+            location = CDN_BASE + quote(filename)
+            record["file"] = None
+            record["fallback"]["cdn"] = True
+            record["fallback"]["redirect_to"] = location
+            self._send_redirect(location, resp, {"level": level})
+            return
         # 该 IP 已退到更兼容的档，但当前 token 指的是旧档 → 再签一个新档 token 跳过去
         if filename and level > info["level"]:
             new_token = mint_token(name, level, filename, self.client_address[0])
@@ -560,7 +632,7 @@ def _serve(server, scheme, host, port):
 
 
 def main():
-    global LOG_FH, MEDIA_ROOT
+    global LOG_FH, MEDIA_ROOT, CDN_BASE
     parser = argparse.ArgumentParser(description="VRChat 视频请求探针服务器")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080,
@@ -571,7 +643,16 @@ def main():
     parser.add_argument("--tls-key", help="私钥 PEM（Caddy 的 .key）")
     parser.add_argument("--media-dir", default=str(Path(__file__).parent / "media"))
     parser.add_argument("--log-dir", default=str(Path(__file__).parent / "logs"))
+    parser.add_argument("--cdn-base", metavar="URL",
+                        help="CDN 模式：变体文件所在的公开前缀（如 https://cdn.example.com/vrc/），"
+                             "/t/<token> 对播放器只回 302 到 <URL><file>，本机不发视频字节。"
+                             "media/ 下仍需保留同名文件供 yt-dlp 探测。")
     args = parser.parse_args()
+
+    if args.cdn_base:
+        if not args.cdn_base.startswith(("http://", "https://")):
+            parser.error("--cdn-base 必须是 http(s):// 开头的完整 URL 前缀")
+        CDN_BASE = args.cdn_base.rstrip("/") + "/"
 
     MEDIA_ROOT = Path(args.media_dir).resolve()
     MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
@@ -582,7 +663,7 @@ def main():
     LOG_FH = open(log_path, "a", encoding="utf-8")
     log_event({"event": "server_start", "ts": now_iso(), "host": args.host,
                "http_port": args.port, "tls_port": args.tls_port,
-               "media_dir": str(MEDIA_ROOT),
+               "media_dir": str(MEDIA_ROOT), "cdn_base": CDN_BASE,
                "fallback_sets": sorted(FALLBACK_MANIFEST)})
 
     servers = []
@@ -604,6 +685,8 @@ def main():
     print(f"日志文件 : {log_path}")
     if FALLBACK_MANIFEST:
         print(f"Fallback : {', '.join(sorted(FALLBACK_MANIFEST))}")
+    if CDN_BASE:
+        print(f"CDN 模式 : 播放器 302 到 {CDN_BASE}<file>，本机不发视频字节")
     for ip in get_lan_ips():
         print(f"  本机地址: {ip}")
     print("Ctrl+C 停止。\n")
