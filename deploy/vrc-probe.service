@@ -1,0 +1,20 @@
+[Unit]
+Description=VRC video probe server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vrc-probe
+# HTTP 基线在 :8080；HTTPS 直接终止 TLS 在 :8443，复用 Caddy 为 g.yxu33.com 签的证书。
+# 证书续期后需 restart 本服务才会加载新证书（Python 启动时载入到内存）。
+ExecStart=/usr/bin/python3 /opt/vrc-probe/server.py \
+    --port 8080 \
+    --tls-port 8443 \
+    --tls-cert /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/g.yxu33.com/g.yxu33.com.crt \
+    --tls-key /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/g.yxu33.com/g.yxu33.com.key
+# 无缓冲输出，journalctl 里能实时看到每条请求
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

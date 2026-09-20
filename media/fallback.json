@@ -1,0 +1,10 @@
+{
+  "demo": {
+    "variants": [
+      "demo_av1.mp4",
+      "demo_vp9.webm",
+      "demo_h265.mp4",
+      "demo_h264.mp4"
+    ]
+  }
+}

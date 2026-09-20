@@ -1,0 +1,7 @@
+
+# vrc-probe: 仅用于让 Caddy 为 g.yxu33.com 申请/续期证书。
+# 探针本体不走 Caddy 反代（反代会规范化请求头、抹掉指纹），
+# 而是由 server.py 直接终止 TLS：HTTP 在 :8080，HTTPS(直连 TLS) 在 :8443。
+g.yxu33.com {
+	respond "vrc-probe up. HTTP: :8080  HTTPS(direct-TLS): :8443" 200
+}

@@ -1,0 +1,20 @@
+# 运行时产物
+# 探针日志含测试者公网 IP，不入库
+logs/
+__pycache__/
+*.pyc
+
+# 媒体文件：体积大 / 有版权，只保留 fallback 清单和冒烟用的 m3u8
+media/*
+!media/fallback.json
+!media/_smoke/
+media/_smoke/*
+!media/_smoke/test.m3u8
+
+# 证书与密钥
+*.pem
+*.key
+*.crt
+
+# 本地工具配置
+.claude/settings.local.json
